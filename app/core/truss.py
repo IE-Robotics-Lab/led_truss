@@ -364,7 +364,7 @@ class truss:
                     self.glow(Color(255, 255, 255))  # White for no change
             
             previous_price = current_price
-
+    
     def heart_rate(self, url, poll_hz=1.0, min_hr=40, yellow_start=75, red_start=120, max_hr=200, pulse=True):
         """
         Read heart rate from a page element (#heartRate) and map BPM to color.

@@ -341,101 +341,112 @@ class truss:
                     self.glow(Color(255, 255, 255))  # White for no change
             
             previous_price = current_price
-
-    def heart_rate(self, url, poll_hz = 1.0, min_hr = 40, yellow_start = 75, red_start = 120, max_hr = 200, pulse = True):
-        """Read heart rate from an app.heart.io-like widget and map value to color.
-
-        Simple implementation: open the page, read `.heartrate` every tick, set color.
+    
+    def heart_rate(self, url, poll_hz=1.0, min_hr=40, yellow_start=75, red_start=120, max_hr=200, pulse=True):
         """
-
-        from playwright.sync_api import sync_playwright
-
+        Read heart rate from a page element (#heartRate) and map BPM to color.
+        Supports multiple URLs separated by commas; uses average BPM across sources.
+        """
+    
+        import time
+        import numpy as np
+        from rpi_ws281x import Color
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+    
+        SELECTOR = "#heartRate"
+    
         def clamp(value, low, high):
             return max(low, min(high, value))
-
+    
         def lerp(a, b, t):
             return int(a + (b - a) * t)
-
+    
         def color_from_hr(hr_value):
-            # Gradient: green -> yellow -> red, returns (r, g, b)
             hr = clamp(hr_value, min_hr, max_hr)
             if hr <= yellow_start:
-                # green (0,255,0) to yellow (255,255,0)
                 t = 1.0 if yellow_start == min_hr else (hr - min_hr) / float(max(1, yellow_start - min_hr))
                 return (lerp(0, 255, t), 255, 0)
             if hr < red_start:
-                # yellow (255,255,0) to red (255,0,0)
                 t = 1.0 if red_start == yellow_start else (hr - yellow_start) / float(max(1, red_start - yellow_start))
                 return (255, lerp(255, 0, t), 0)
             return (255, 0, 0)
-
+    
         def compute_bpm_period_seconds(hr_value):
-            safe_hr = max(1, hr_value)
+            safe_hr = max(1, int(hr_value))
             return 60.0 / float(safe_hr)
-
-        # Support multiple URLs separated by commas; compute average heart rate
-        urls = [u.strip() for u in str(url).split(',') if u.strip()]
-        if not urls:
-            urls = [str(url)]
-
+    
+        urls = [u.strip() for u in str(url).split(",") if u.strip()] or [str(url)]
+        poll_period = 1.0 / float(max(0.1, poll_hz))
+    
+        def parse_bpm(text: str):
+            digits = "".join(ch for ch in (text or "") if ch.isdigit())
+            return int(digits) if digits else None
+    
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             try:
                 pages = []
                 for u in urls:
                     pg = browser.new_page()
-                    pg.goto(u, wait_until="domcontentloaded")
-                    pg.wait_for_selector(".heartrate", timeout=20000)
+                    pg.goto(u, wait_until="domcontentloaded", timeout=60000)
+    
+                    # Wait for DOM element to exist (attached), not necessarily visible
+                    try:
+                        pg.wait_for_selector(SELECTOR, state="attached", timeout=20000)
+                    except PWTimeoutError:
+                        # Hard fail: don’t pretend it’s green; your source is broken.
+                        raise RuntimeError(f"Heart rate element {SELECTOR} not found at {u} (final URL: {pg.url})")
+    
                     pages.append(pg)
-
+    
                 latest_hr = None
                 next_poll_time = 0.0
-                poll_period = 1.0 / float(max(0.1, poll_hz))
+                consecutive_empty = 0
+    
                 while True:
                     if self._cancel_event.is_set():
                         return
+    
                     now = time.time()
-                    # Polling in Hz
+    
                     if now >= next_poll_time:
                         values = []
                         for pg in pages:
                             try:
-                                text = pg.inner_text(".heartrate")
-                                digits = ''.join(ch for ch in text if ch.isdigit())
-                                if digits:
-                                    values.append(int(digits))
+                                raw = pg.locator(SELECTOR).inner_text(timeout=2000)
+                                bpm = parse_bpm(raw)
+                                if bpm is not None:
+                                    values.append(bpm)
                             except Exception:
-                                # Ignore read errors for individual pages in this cycle
                                 pass
+    
                         if values:
                             latest_hr = int(round(sum(values) / float(len(values))))
+                            consecutive_empty = 0
                         else:
-                            # If no numeric HR is visible (e.g., "-"), treat as 0 to show solid green
-                            latest_hr = 0
+                            consecutive_empty += 1
+                            # After some misses, treat as "unknown" rather than forcing 0
+                            if consecutive_empty >= 3:
+                                latest_hr = None
+    
                         next_poll_time = now + poll_period
-
-                    # Determine color from latest HR (fallback to green if unknown)
+    
+                    # Determine base color
                     base_rgb = (0, 255, 0) if latest_hr is None else color_from_hr(latest_hr)
-
-                    # Glow at HR frequency if enabled: brightness follows cosine with period derived from BPM
+    
+                    # Pulse at HR frequency if enabled
                     if pulse and latest_hr is not None and latest_hr > 0:
                         period = compute_bpm_period_seconds(latest_hr)
-                        # map current time to [0..1] phase
                         phase = (now % period) / period
-                        # cosine brightness [0..1]
                         brightness_scale = (1.0 - np.cos(phase * 2 * np.pi)) * 0.5
                     else:
                         brightness_scale = 1.0
-
-                    # Apply scaled brightness to the display color
+    
                     r = int(base_rgb[0] * brightness_scale)
                     g = int(base_rgb[1] * brightness_scale)
                     b = int(base_rgb[2] * brightness_scale)
-                    scaled_color = Color(r, g, b)
-                    self.set_color_all(scaled_color)
-
-                    # Small frame delay for smooth animation
+                    self.set_color_all(Color(r, g, b))
+    
                     time.sleep(0.02)
             finally:
                 browser.close()
-        
